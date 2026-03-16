@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
+  <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
+  <style>
+    body { margin: 0; padding: 0; overflow: hidden; background: white; font-family: sans-serif; }
+    #preview { width: 100vw; height: 100vh; border: none; }
+    #error { display: none; color: #d32f2f; background: #ffebee; padding: 20px; position: absolute; top: 0; left: 0; right: 0; z-index: 1000; }
+    #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; }
+  </style>
+</head>
+<body>
+  <div id="loading">⚡ Booting WebContainer...</div>
+  <iframe id="preview" sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-downloads" style="display: none;"></iframe>
+  <div id="error"></div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "@webcontainer/api": "https://esm.sh/@webcontainer/api@1.2.4"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import { WebContainer } from '@webcontainer/api';
+
+    const previewFrame = document.getElementById('preview');
+    const loadingDiv = document.getElementById('loading');
+    const errorDiv = document.getElementById('error');
+    const sessionId = window.location.pathname.split('/').pop();
+
+    function showError(type, message, details = {}) {
+      console.error(type, message, details);
+      errorDiv.style.display = 'block';
+      errorDiv.innerHTML = `<strong>${type}:</strong> ${message}`;
+      loadingDiv.style.display = 'none';
+      
+      fetch(`/api/preview/${sessionId}/error`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type, message, details })
+      }).catch(() => {});
+    }
+
+    async function boot() {
+      try {
+        const sessionRes = await fetch(`/api/preview/${sessionId}`);
+        if (!sessionRes.ok) throw new Error('Preview session expired');
+        const session = await sessionRes.json();
+        
+        const webcontainer = await WebContainer.boot();
+        loadingDiv.innerText = '📁 Mounting files...';
+        
+        const mountStructure = {};
+        for (const [filePath, fileContent] of Object.entries(session.files)) {
+          const parts = filePath.split('/');
+          let current = mountStructure;
+          for (let i = 0; i < parts.length; i++) {
+            const part = parts[i];
+            if (i === parts.length - 1) {
+              current[part] = { file: { contents: fileContent } };
+            } else {
+              current[part] = current[part] || { directory: {} };
+              current = current[part].directory;
+            }
+          }
+        }
+        
+        await webcontainer.mount(mountStructure);
+        
+        if (session.files['package.json']) {
+          loadingDiv.innerText = '📦 Installing dependencies...';
+          const installProcess = await webcontainer.spawn('npm', ['install']);
+          installProcess.output.pipeTo(new WritableStream({
+            write(data) { console.log('npm install:', data); }
+          }));
+          const installExit = await installProcess.exit;
+          if (installExit !== 0) {
+            showError('Installation Failed', 'npm install exited with code ' + installExit);
+            return;
+          }
+        }
+        
+        loadingDiv.innerText = '🚀 Starting dev server...';
+        
+        let startCmd = 'npm', startArgs = ['run', 'start'];
+        if (!session.files['package.json']) {
+          startCmd = 'npx';
+          startArgs = ['serve', '--port', '3000'];
+        }
+        
+        const startProcess = await webcontainer.spawn(startCmd, startArgs);
+        
+        startProcess.output.pipeTo(new WritableStream({
+          write(data) {
+            console.log('server:', data);
+            if (data.includes('Error:')) {
+              showError('Runtime Error', data);
+            }
+          }
+        }));
+        
+        webcontainer.on('server-ready', (port, url) => {
+          loadingDiv.style.display = 'none';
+          previewFrame.style.display = 'block';
+          previewFrame.src = url;
+        });
+        
+        setTimeout(() => {
+          if (previewFrame.style.display === 'none') {
+            showError('Timeout', 'Dev server did not start within 30 seconds');
+          }
+        }, 30000);
+        
+      } catch (error) {
+        showError('Boot Failed', error.message);
+      }
+    }
+    
+    boot();
+  </script>
+</body>
+</html>
