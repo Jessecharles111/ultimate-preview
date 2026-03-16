@@ -7,7 +7,7 @@
   <style>
     body { margin: 0; padding: 0; overflow: hidden; background: white; font-family: sans-serif; }
     #preview { width: 100vw; height: 100vh; border: none; }
-    #error { display: none; color: #d32f2f; background: #ffebee; padding: 20px; position: absolute; top: 0; left: 0; right: 0; z-index: 1000; }
+    #error { display: none; color: #d32f2f; background: #ffebee; padding: 20px; position: absolute; top: 0; left: 0; right: 0; z-index: 1000; white-space: pre-wrap; font-family: monospace; max-height: 200px; overflow: auto; }
     #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; }
   </style>
 </head>
@@ -32,28 +32,80 @@
     const errorDiv = document.getElementById('error');
     const sessionId = window.location.pathname.split('/').pop();
 
-    function showError(type, message, details = {}) {
+    // Report errors to backend
+    function reportError(type, message, details = {}) {
       console.error(type, message, details);
       errorDiv.style.display = 'block';
-      errorDiv.innerHTML = `<strong>${type}:</strong> ${message}`;
+      errorDiv.innerHTML += `<div><strong>${type}:</strong> ${message}</div>`;
       loadingDiv.style.display = 'none';
       
       fetch(`/api/preview/${sessionId}/error`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type, message, details })
+        body: JSON.stringify({ type, message, ...details, timestamp: Date.now() })
       }).catch(() => {});
     }
 
+    // Inject error interceptor into the iframe
+    function injectErrorInterceptor(iframe) {
+      const interceptorCode = `
+        (function() {
+          const originalConsoleError = console.error;
+          console.error = function(...args) {
+            originalConsoleError.apply(console, args);
+            window.parent.postMessage({ type: 'console-error', args: args.map(String) }, '*');
+          };
+          window.addEventListener('error', (event) => {
+            window.parent.postMessage({ 
+              type: 'runtime-error', 
+              message: event.message, 
+              filename: event.filename, 
+              lineno: event.lineno, 
+              colno: event.colno,
+              stack: event.error?.stack 
+            }, '*');
+          });
+          window.addEventListener('unhandledrejection', (event) => {
+            window.parent.postMessage({ 
+              type: 'unhandled-rejection', 
+              reason: event.reason?.toString() 
+            }, '*');
+          });
+        })();
+      `;
+      
+      iframe.addEventListener('load', () => {
+        iframe.contentWindow.postMessage({ type: 'inject', code: interceptorCode }, '*');
+      });
+    }
+
+    // Listen for error messages from iframe
+    window.addEventListener('message', (event) => {
+      if (event.data.type?.startsWith('runtime-') || event.data.type === 'console-error') {
+        reportError(event.data.type, event.data.message || event.data.args?.join(' '), event.data);
+      }
+    });
+
     async function boot() {
       try {
+        // Fetch session data
         const sessionRes = await fetch(`/api/preview/${sessionId}`);
         if (!sessionRes.ok) throw new Error('Preview session expired');
         const session = await sessionRes.json();
         
+        // Boot WebContainer
         const webcontainer = await WebContainer.boot();
         loadingDiv.innerText = '📁 Mounting files...';
         
+        // Mount files in parallel (if many files, this helps)
+        const mountPromises = [];
+        for (const [filePath, fileContent] of Object.entries(session.files)) {
+          const parts = filePath.split('/');
+          // We'll build the tree in one go; WebContainer's mount is atomic, but we can still do it in one call.
+          // Actually, we can construct the full tree in one object.
+        }
+        
+        // Construct mount structure
         const mountStructure = {};
         for (const [filePath, fileContent] of Object.entries(session.files)) {
           const parts = filePath.split('/');
@@ -71,23 +123,39 @@
         
         await webcontainer.mount(mountStructure);
         
+        // Check for package.json
         if (session.files['package.json']) {
           loadingDiv.innerText = '📦 Installing dependencies...';
-          const installProcess = await webcontainer.spawn('npm', ['install']);
+          
+          // Determine if package-lock.json exists for faster install
+          const hasLockfile = session.files['package-lock.json'];
+          const installCmd = hasLockfile ? 'ci' : 'install';
+          
+          const installProcess = await webcontainer.spawn('npm', [installCmd]);
+          
           installProcess.output.pipeTo(new WritableStream({
-            write(data) { console.log('npm install:', data); }
+            write(data) {
+              console.log('npm install:', data);
+              // Capture any install errors
+              if (data.includes('error') || data.includes('ERR!')) {
+                reportError('Install Error', data);
+              }
+            }
           }));
+          
           const installExit = await installProcess.exit;
           if (installExit !== 0) {
-            showError('Installation Failed', 'npm install exited with code ' + installExit);
+            reportError('Installation Failed', `npm ${installCmd} exited with code ${installExit}`);
             return;
           }
         }
         
         loadingDiv.innerText = '🚀 Starting dev server...';
         
+        // Determine start command
         let startCmd = 'npm', startArgs = ['run', 'start'];
         if (!session.files['package.json']) {
+          // Static site: use `npx serve` (faster, no build)
           startCmd = 'npx';
           startArgs = ['serve', '--port', '3000'];
         }
@@ -97,26 +165,30 @@
         startProcess.output.pipeTo(new WritableStream({
           write(data) {
             console.log('server:', data);
+            // Capture runtime errors from server stderr
             if (data.includes('Error:')) {
-              showError('Runtime Error', data);
+              reportError('Runtime Error', data);
             }
           }
         }));
         
+        // Wait for server to be ready
         webcontainer.on('server-ready', (port, url) => {
           loadingDiv.style.display = 'none';
           previewFrame.style.display = 'block';
           previewFrame.src = url;
+          injectErrorInterceptor(previewFrame);
         });
         
+        // Timeout after 30 seconds
         setTimeout(() => {
           if (previewFrame.style.display === 'none') {
-            showError('Timeout', 'Dev server did not start within 30 seconds');
+            reportError('Timeout', 'Dev server did not start within 30 seconds');
           }
         }, 30000);
         
       } catch (error) {
-        showError('Boot Failed', error.message);
+        reportError('Boot Failed', error.message, { stack: error.stack });
       }
     }
     
