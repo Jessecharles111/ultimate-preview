@@ -73,6 +73,8 @@
     const errorDiv = document.getElementById('error');
     const sessionId = window.location.pathname.split('/').pop();
 
+    let startupTimeout; // to clear timeout later
+
     function reportError(type, message, details = {}) {
       console.error(type, message, details);
       errorDiv.style.display = 'block';
@@ -190,20 +192,21 @@
           }
         }));
         
+        // Set a 5‑minute timeout (300 seconds)
+        startupTimeout = setTimeout(() => {
+          reportError('Timeout', 'Dev server did not start within 300 seconds');
+        }, 300000);
+        
         webcontainer.on('server-ready', (port, url) => {
+          clearTimeout(startupTimeout); // Cancel the timeout
           loadingDiv.style.display = 'none';
           previewFrame.style.display = 'block';
           previewFrame.src = url;
           injectErrorInterceptor(previewFrame);
         });
         
-        setTimeout(() => {
-          if (previewFrame.style.display === 'none') {
-            reportError('Timeout', 'Dev server did not start within 30 seconds');
-          }
-        }, 30000);
-        
       } catch (error) {
+        clearTimeout(startupTimeout); // Clean up if error occurs before server-ready
         reportError('Boot Failed', error.message, { stack: error.stack });
       }
     }
