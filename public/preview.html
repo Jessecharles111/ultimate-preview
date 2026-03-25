@@ -74,40 +74,37 @@
     let startupTimeout;
     let db;
 
-    // -------------------- IndexedDB helpers --------------------
+    // IndexedDB helpers
     async function openDB() {
       return new Promise((resolve, reject) => {
-        const req = indexedDB.open('wc-cache', 2);
+        const req = indexedDB.open('wc-cache', 1);
         req.onerror = () => reject(req.error);
         req.onupgradeneeded = (e) => {
           const db = e.target.result;
           if (!db.objectStoreNames.contains('templates')) {
             db.createObjectStore('templates');
           }
-          if (!db.objectStoreNames.contains('pnpm-store')) {
-            db.createObjectStore('pnpm-store');
-          }
         };
         req.onsuccess = () => resolve(req.result);
       });
     }
 
-    async function getCached(key, storeName = 'templates') {
+    async function getCached(key) {
       if (!db) db = await openDB();
       return new Promise((resolve, reject) => {
-        const tx = db.transaction(storeName, 'readonly');
-        const store = tx.objectStore(storeName);
+        const tx = db.transaction('templates', 'readonly');
+        const store = tx.objectStore('templates');
         const req = store.get(key);
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error);
       });
     }
 
-    async function setCached(key, value, storeName = 'templates') {
+    async function setCached(key, value) {
       if (!db) db = await openDB();
       return new Promise((resolve, reject) => {
-        const tx = db.transaction(storeName, 'readwrite');
-        const store = tx.objectStore(storeName);
+        const tx = db.transaction('templates', 'readwrite');
+        const store = tx.objectStore('templates');
         const req = store.put(value, key);
         req.onsuccess = () => resolve();
         req.onerror = () => reject(req.error);
@@ -121,8 +118,35 @@
       return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
-    // -------------------- Tar extraction (fast, parallel) --------------------
-    async function extractTar(webcontainer, gzipped, targetDir = '/') {
+    // -------------------- Tar helpers (no stat) --------------------
+    async function readAllFiles(webcontainer, dir = '/') {
+      const files = [];
+      const stack = [dir];
+      while (stack.length) {
+        const current = stack.pop();
+        let entries;
+        try {
+          entries = await webcontainer.fs.readdir(current);
+        } catch (e) {
+          continue;
+        }
+        for (const entry of entries) {
+          const full = `${current === '/' ? '' : current}/${entry}`;
+          try {
+            // Attempt to read as file; if it's a directory, readdir would have listed it but we can't differentiate without stat.
+            // Simpler: we can attempt to read file; if error, assume directory.
+            const content = await webcontainer.fs.readFile(full, 'utf-8');
+            files.push({ path: full.slice(1), content });
+          } catch (e) {
+            // It's a directory – push to stack
+            stack.push(full);
+          }
+        }
+      }
+      return files;
+    }
+
+    async function writeTar(webcontainer, gzipped, targetDir = '/') {
       const uint8 = new Uint8Array(gzipped);
       const data = pako.ungzip(uint8, { to: 'string' });
       const lines = data.split('\n');
@@ -151,22 +175,8 @@
       }
     }
 
-    async function createTarFromDir(webcontainer, dir) {
-      const files = [];
-      const walk = async (current) => {
-        const entries = await webcontainer.fs.readdir(current);
-        for (const e of entries) {
-          const full = `${current}/${e}`;
-          const stat = await webcontainer.fs.stat(full);
-          if (stat.isDirectory) {
-            await walk(full);
-          } else {
-            const content = await webcontainer.fs.readFile(full, 'utf-8');
-            files.push({ path: full.slice(1), content });
-          }
-        }
-      };
-      await walk(dir);
+    async function createTar(webcontainer) {
+      const files = await readAllFiles(webcontainer);
       let tar = '';
       for (const f of files) {
         const name = f.path;
@@ -187,20 +197,17 @@
     }
 
     // -------------------- Pre‑built template --------------------
-    // We'll create a minimal Vite + React template and cache it as a tarball.
-    // The template's package.json and node_modules are included.
-    // For this to work, we must generate it once.
     async function ensureBaseTemplate(webcontainer) {
       const templateKey = 'vite-react-template-v1';
       const cached = await getCached(templateKey);
       if (cached) {
         loadingMessage.innerText = 'Restoring base template...';
-        await extractTar(webcontainer, cached);
+        await writeTar(webcontainer, cached);
         return true;
       }
 
       loadingMessage.innerText = 'Preparing base template (first time only)...';
-      // Create minimal files
+      // Create base files
       await webcontainer.fs.mkdir('/src', { recursive: true });
       await webcontainer.fs.writeFile('/package.json', JSON.stringify({
         name: "template",
@@ -217,12 +224,13 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
       await webcontainer.fs.writeFile('/src/App.jsx', `export default function App() { return <h1>Hello World</h1>; }`);
       await webcontainer.fs.writeFile('/vite.config.js', `import { defineConfig } from 'vite'; import react from '@vitejs/plugin-react'; export default defineConfig({ plugins: [react()] });`);
 
-      // Install dependencies with pnpm (fast)
+      // Install dependencies with pnpm
       loadingMessage.innerText = 'Installing base dependencies (pnpm)...';
       const install = await webcontainer.spawn('pnpm', ['install', '--prefer-offline']);
       await install.exit;
+
       // Cache the whole template (including node_modules)
-      const tarball = await createTarFromDir(webcontainer, '/');
+      const tarball = await createTar(webcontainer);
       await setCached(templateKey, tarball);
       return true;
     }
@@ -267,7 +275,6 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
       }
     });
 
-    // -------------------- Dev command detection --------------------
     function getDevCommand(pkg) {
       const scripts = pkg.scripts || {};
       let cmd = scripts.dev || scripts.start || scripts.serve;
@@ -281,7 +288,6 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
       return { direct: false, cmd: 'npx', args: ['serve', '--port', '3000'] };
     }
 
-    // -------------------- Main boot --------------------
     async function boot() {
       try {
         const res = await fetch(`/api/preview/${sessionId}`);
@@ -291,14 +297,17 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
         const wc = await WebContainer.boot();
         loadingMessage.innerText = 'Setting up environment...';
 
-        // Install pnpm inside WebContainer (it's already there in most base images)
-        // but ensure it's available.
-        await wc.spawn('npm', ['install', '-g', 'pnpm']).exit;
+        // Ensure pnpm is installed (most base images have it, but just in case)
+        const pnpmCheck = await wc.spawn('pnpm', ['--version']).exit.catch(() => 1);
+        if (pnpmCheck !== 0) {
+          loadingMessage.innerText = 'Installing pnpm...';
+          await wc.spawn('npm', ['install', '-g', 'pnpm']).exit;
+        }
 
-        // Ensure base template is ready (first time takes ~30s, subsequent <2s)
+        // Ensure base template is ready
         await ensureBaseTemplate(wc);
 
-        // Overlay user files (they will replace template files)
+        // Overlay user files (they replace template files)
         loadingMessage.innerText = 'Applying your code...';
         const mountStructure = {};
         for (const [path, content] of Object.entries(session.files)) {
@@ -320,7 +329,6 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
         if (session.files['package.json']) {
           const userPkg = JSON.parse(session.files['package.json']);
           const basePkg = JSON.parse(await wc.fs.readFile('/package.json', 'utf-8'));
-          // quick check: if dependencies differ, install
           if (JSON.stringify(userPkg.dependencies) !== JSON.stringify(basePkg.dependencies)) {
             loadingMessage.innerText = 'Syncing dependencies...';
             await wc.fs.writeFile('/package.json', JSON.stringify(userPkg, null, 2));
@@ -331,10 +339,10 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
 
         // Start dev server
         loadingMessage.innerText = 'Starting dev server...';
-        let cmd, args;
         const pkgContent = await wc.fs.readFile('/package.json', 'utf-8');
         const pkg = JSON.parse(pkgContent);
         const dev = getDevCommand(pkg);
+        let cmd, args;
         if (dev.direct) {
           cmd = 'npx';
           args = [dev.cmd, ...dev.args];
