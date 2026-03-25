@@ -14,7 +14,6 @@
 </head>
 <body>
   <div id="loading">
-    <!-- Animated SVG – fast loading indicator -->
     <svg width="100" height="100" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
       <defs>
         <radialGradient id="dotGrad" cx="30%" cy="30%" r="70%">
@@ -70,8 +69,7 @@
     const errorDiv = document.getElementById('error');
     const sessionId = window.location.pathname.split('/').pop();
 
-    let startupTimeout;   // for dev server startup
-    let installTimeout;   // for npm install
+    let startupTimeout;
 
     function reportError(type, message, details = {}) {
       console.error(type, message, details);
@@ -122,21 +120,21 @@
       }
     });
 
-    // Helper to get the best dev command from package.json
+    // Detect the best dev command from package.json
     function getDevCommand(packageJson) {
       const scripts = packageJson.scripts || {};
-      // Prefer "dev" (Vite, Next.js, etc.), then "start", then "serve"
+      // Prefer "dev", then "start", then "serve"
       let cmd = scripts.dev || scripts.start || scripts.serve;
       if (cmd) {
-        // If it's just a simple command like "vite", "next dev", we can run it directly
-        // to avoid the npm wrapper overhead.
-        const simple = cmd.trim().split(' ')[0];
-        if (['vite', 'next', 'webpack', 'parcel', 'vue-cli-service', 'react-scripts'].includes(simple)) {
-          return { direct: true, command: simple, args: cmd.slice(simple.length).trim().split(' ') };
+        // Try to run the binary directly if it's a common tool
+        const firstWord = cmd.trim().split(/\s+/)[0];
+        if (['vite', 'next', 'webpack', 'parcel', 'vue-cli-service', 'react-scripts'].includes(firstWord)) {
+          return { direct: true, command: firstWord, args: cmd.slice(firstWord.length).trim().split(/\s+/) };
         }
-        return { direct: false, command: 'npm', args: ['run', cmd === scripts.dev ? 'dev' : (cmd === scripts.start ? 'start' : 'serve')] };
+        // Otherwise fallback to npm run
+        return { direct: false, command: 'npm', args: ['run', scripts.dev ? 'dev' : (scripts.start ? 'start' : 'serve')] };
       }
-      // Fallback: try npx serve for static sites
+      // No script, try npx serve for static
       return { direct: false, command: 'npx', args: ['serve', '--port', '3000'] };
     }
 
@@ -149,7 +147,7 @@
         const webcontainer = await WebContainer.boot();
         loadingMessage.innerText = 'Mounting files...';
 
-        // Mount files (WebContainer handles it atomically)
+        // Mount files in one go
         const mountStructure = {};
         for (const [filePath, fileContent] of Object.entries(session.files)) {
           const parts = filePath.split('/');
@@ -166,21 +164,22 @@
         }
         await webcontainer.mount(mountStructure);
 
-        // ---- Dependency installation ----
+        // ---- Install dependencies if package.json exists ----
         if (session.files['package.json']) {
           loadingMessage.innerText = 'Installing dependencies...';
 
-          // Use npm ci if lockfile exists, otherwise install
           const hasLockfile = session.files['package-lock.json'];
+          // Use npm ci if lockfile exists (faster), else install with optimised flags
           const installCmd = hasLockfile ? 'ci' : 'install';
-          const installProcess = await webcontainer.spawn('npm', [installCmd, '--prefer-offline']);
+          const installArgs = [installCmd, '--prefer-offline', '--no-audit', '--no-fund'];
+          const installProcess = await webcontainer.spawn('npm', installArgs);
 
-          let installErrorOutput = '';
+          let installError = '';
           installProcess.output.pipeTo(new WritableStream({
             write(data) {
               console.log('npm install:', data);
               if (data.includes('error') || data.includes('ERR!')) {
-                installErrorOutput += data;
+                installError += data;
                 reportError('Install Error', data);
               }
             }
@@ -188,22 +187,19 @@
 
           const installExit = await installProcess.exit;
           if (installExit !== 0) {
-            reportError('Installation Failed', `npm ${installCmd} failed with code ${installExit}. Last errors:\n${installErrorOutput.slice(-1000)}`);
+            reportError('Installation Failed', `npm ${installCmd} failed. Last errors:\n${installError.slice(-1000)}`);
             return;
           }
         }
 
-        // ---- Dev server startup ----
+        // ---- Start dev server ----
         loadingMessage.innerText = 'Starting dev server...';
 
         let startCmd, startArgs;
-
         if (session.files['package.json']) {
-          // Parse package.json to get the best dev command
           const pkg = JSON.parse(session.files['package.json']);
           const devInfo = getDevCommand(pkg);
           if (devInfo.direct) {
-            // Direct execution: e.g., "vite"
             startCmd = 'npx';   // ensures local binary is used
             startArgs = [devInfo.command, ...devInfo.args];
           } else {
@@ -211,7 +207,7 @@
             startArgs = devInfo.args;
           }
         } else {
-          // Static site – serve with npx
+          // Static site – serve with npx (extremely fast)
           startCmd = 'npx';
           startArgs = ['serve', '--port', '3000'];
         }
@@ -226,10 +222,10 @@
           }
         }));
 
-        // 400 seconds for dev server to become ready
+        // 1000 seconds timeout – enough for huge installs
         startupTimeout = setTimeout(() => {
-          reportError('Timeout', 'Dev server did not start within 400 seconds');
-        }, 400000);
+          reportError('Timeout', 'Dev server did not start within 1000 seconds');
+        }, 1000000);
 
         webcontainer.on('server-ready', (port, url) => {
           clearTimeout(startupTimeout);
