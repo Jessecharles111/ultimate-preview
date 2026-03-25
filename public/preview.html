@@ -55,15 +55,13 @@
   <script type="importmap">
     {
       "imports": {
-        "@webcontainer/api": "https://esm.sh/@webcontainer/api@1.2.4",
-        "pako": "https://esm.sh/pako@2.1.0"
+        "@webcontainer/api": "https://esm.sh/@webcontainer/api@1.2.4"
       }
     }
   </script>
 
   <script type="module">
     import { WebContainer } from '@webcontainer/api';
-    import pako from 'pako';
 
     const previewFrame = document.getElementById('preview');
     const loadingDiv = document.getElementById('loading');
@@ -74,37 +72,37 @@
     let startupTimeout;
     let db;
 
-    // ---------- IndexedDB ----------
+    // -------------------- IndexedDB helpers --------------------
     async function openDB() {
       return new Promise((resolve, reject) => {
         const req = indexedDB.open('wc-cache', 1);
         req.onerror = () => reject(req.error);
         req.onupgradeneeded = (e) => {
           const db = e.target.result;
-          if (!db.objectStoreNames.contains('templates')) {
-            db.createObjectStore('templates');
+          if (!db.objectStoreNames.contains('cache')) {
+            db.createObjectStore('cache');
           }
         };
         req.onsuccess = () => resolve(req.result);
       });
     }
 
-    async function getCached(key) {
+    async function getCache(key) {
       if (!db) db = await openDB();
       return new Promise((resolve, reject) => {
-        const tx = db.transaction('templates', 'readonly');
-        const store = tx.objectStore('templates');
+        const tx = db.transaction('cache', 'readonly');
+        const store = tx.objectStore('cache');
         const req = store.get(key);
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error);
       });
     }
 
-    async function setCached(key, value) {
+    async function setCache(key, value) {
       if (!db) db = await openDB();
       return new Promise((resolve, reject) => {
-        const tx = db.transaction('templates', 'readwrite');
-        const store = tx.objectStore('templates');
+        const tx = db.transaction('cache', 'readwrite');
+        const store = tx.objectStore('cache');
         const req = store.put(value, key);
         req.onsuccess = () => resolve();
         req.onerror = () => reject(req.error);
@@ -118,40 +116,10 @@
       return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
-    // ---------- Tar helpers (no stat) ----------
-    async function extractTar(webcontainer, gzipped) {
-      const uint8 = new Uint8Array(gzipped);
-      const data = pako.ungzip(uint8, { to: 'string' });
-      const lines = data.split('\n');
-      const entries = [];
-      for (let i = 0; i < lines.length; ) {
-        const header = lines[i];
-        if (header.length < 100) break;
-        const name = header.slice(0, 100).replace(/\0.*$/, '');
-        const sizeStr = header.slice(124, 136).replace(/\0.*$/, '');
-        const size = parseInt(sizeStr, 8);
-        if (size === 0) { i++; continue; }
-        const content = lines.slice(i + 1, i + 1 + Math.ceil(size / 512)).join('\n').slice(0, size);
-        entries.push({ path: name, content });
-        i += 1 + Math.ceil(size / 512);
-      }
-      const concurrency = 50;
-      for (let i = 0; i < entries.length; i += concurrency) {
-        const chunk = entries.slice(i, i + concurrency);
-        await Promise.all(chunk.map(async ({ path, content }) => {
-          const dir = path.substring(0, path.lastIndexOf('/'));
-          if (dir && !await webcontainer.fs.exists(dir).catch(() => false)) {
-            await webcontainer.fs.mkdir(dir, { recursive: true });
-          }
-          await webcontainer.fs.writeFile(path, content);
-        }));
-      }
-    }
-
-    async function createTar(webcontainer, root = '/') {
-      // Recursively collect all files without using stat
-      const files = [];
-      const stack = [root];
+    // -------------------- Directory traversal (no stat) --------------------
+    async function walkFiles(webcontainer, dir) {
+      const files = {};
+      const stack = [dir];
       while (stack.length) {
         const current = stack.pop();
         let entries;
@@ -162,43 +130,40 @@
         }
         for (const entry of entries) {
           const full = current === '/' ? `/${entry}` : `${current}/${entry}`;
-          // Attempt to read file; if fails, assume directory
           try {
             const content = await webcontainer.fs.readFile(full, 'utf-8');
-            files.push({ path: full.slice(1), content });
+            files[full.slice(1)] = content;
           } catch (e) {
-            // Directory – push to stack
+            // It's a directory – push to stack
             stack.push(full);
           }
         }
       }
-      // Build tar
-      let tar = '';
-      for (const f of files) {
-        const name = f.path;
-        const content = f.content;
-        const nameBuf = name.padEnd(100, '\0');
-        const size = content.length;
-        const sizeOctal = size.toString(8).padStart(11, '0') + '\0';
-        const header = nameBuf + '0000644\0' + '0000000\0' + '0000000\0' +
-                       sizeOctal + '00000000000\0' + '00000000000\0' +
-                       '        '.padEnd(8, '\0') + 'ustar\0' + '00' + 'root\0'.padEnd(32, '\0') +
-                       'root\0'.padEnd(32, '\0') + '\0'.repeat(255 - (name.length + 100 + 24 + 12 + 12 + 8 + 32 + 32));
-        tar += header + content;
-        const padding = Math.ceil(size / 512) * 512 - size;
-        if (padding > 0) tar += '\0'.repeat(padding);
-      }
-      const gz = pako.gzip(tar);
-      return gz.buffer;
+      return files;
     }
 
-    // ---------- Template creation and caching ----------
+    async function writeFiles(webcontainer, files) {
+      const concurrency = 50;
+      const entries = Object.entries(files);
+      for (let i = 0; i < entries.length; i += concurrency) {
+        const chunk = entries.slice(i, i + concurrency);
+        await Promise.all(chunk.map(async ([path, content]) => {
+          const dir = path.substring(0, path.lastIndexOf('/'));
+          if (dir && !await webcontainer.fs.exists(dir).catch(() => false)) {
+            await webcontainer.fs.mkdir(dir, { recursive: true });
+          }
+          await webcontainer.fs.writeFile(path, content);
+        }));
+      }
+    }
+
+    // -------------------- Base template creation & caching --------------------
     async function ensureBaseTemplate(webcontainer) {
-      const templateKey = 'vite-react-template-v2';
-      const cached = await getCached(templateKey);
+      const templateKey = 'vite-react-template-v3';
+      const cached = await getCache(templateKey);
       if (cached) {
         loadingMessage.innerText = 'Restoring base template...';
-        await extractTar(webcontainer, cached);
+        await writeFiles(webcontainer, cached);
         return true;
       }
 
@@ -231,18 +196,18 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
 import react from '@vitejs/plugin-react';
 export default defineConfig({ plugins: [react()] });`);
 
-      // Install dependencies with pnpm (fast)
+      // Install dependencies
       loadingMessage.innerText = 'Installing base dependencies...';
       const install = await webcontainer.spawn('pnpm', ['install', '--prefer-offline', '--no-audit', '--no-fund']);
       await install.exit;
 
       // Cache the whole project (including node_modules)
-      const tarball = await createTar(webcontainer);
-      await setCached(templateKey, tarball);
+      const files = await walkFiles(webcontainer, '/');
+      await setCache(templateKey, files);
       return true;
     }
 
-    // ---------- Error reporting ----------
+    // -------------------- Error reporting --------------------
     function reportError(type, message, details = {}) {
       console.error(type, message, details);
       errorDiv.style.display = 'block';
@@ -282,7 +247,6 @@ export default defineConfig({ plugins: [react()] });`);
       }
     });
 
-    // ---------- Dev command detection ----------
     function getDevCommand(pkg) {
       const scripts = pkg.scripts || {};
       let cmd = scripts.dev || scripts.start || scripts.serve;
@@ -296,7 +260,7 @@ export default defineConfig({ plugins: [react()] });`);
       return { direct: false, cmd: 'npx', args: ['serve', '--port', '3000'] };
     }
 
-    // ---------- Main boot ----------
+    // -------------------- Main boot --------------------
     async function boot() {
       try {
         const res = await fetch(`/api/preview/${sessionId}`);
@@ -307,8 +271,8 @@ export default defineConfig({ plugins: [react()] });`);
         loadingMessage.innerText = 'Setting up environment...';
 
         // Ensure pnpm is installed
-        const pnpmVersion = await wc.spawn('pnpm', ['--version']).exit.catch(() => 1);
-        if (pnpmVersion !== 0) {
+        const pnpmCheck = await wc.spawn('pnpm', ['--version']).exit.catch(() => 1);
+        if (pnpmCheck !== 0) {
           loadingMessage.innerText = 'Installing pnpm...';
           await wc.spawn('npm', ['install', '-g', 'pnpm']).exit;
         }
